@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import numpy as np
 import soundfile as sf
@@ -2001,11 +2003,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         cache_key_source = ref_audio_str
         if not ref_audio_str.startswith(("http://", "https://", "data:")):
             try:
-                path = ref_audio_str[7:] if ref_audio_str.startswith("file://") else ref_audio_str
+                if ref_audio_str.startswith("file://"):
+                    parsed = urlparse(ref_audio_str)
+                    path = url2pathname(
+                        (parsed.netloc or "") + (parsed.path or "")
+                    )
+                else:
+                    path = ref_audio_str
                 st = os.stat(path)
                 cache_key_source = f"{ref_audio_str}:{st.st_mtime}:{st.st_size}"
-            except Exception:
-                pass
+            except OSError:
+                logger.warning(
+                    "Failed to stat ref_audio path %r; falling back to "
+                    "string-only cache key (stale cache possible)",
+                    ref_audio_str,
+                )
         return hashlib.sha1(cache_key_source.encode("utf-8")).hexdigest()
 
     async def _resolve_ref_audio(self, ref_audio_str: str) -> tuple[list[float], int]:
