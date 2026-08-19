@@ -7,6 +7,7 @@ import torch.nn as nn
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    _undecorate_dynamo,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
@@ -190,6 +191,57 @@ def _forward(model, infos, placeholder_counts=None, request_ids=None):
         runtime_additional_information=infos,
         request_ids=request_ids,
     )
+
+
+def test_init_accepts_encoder_stub_without_running_it():
+    """#6366: construction unwraps encoder.forward_chunk and must not require Dynamo.
+
+    The NPUGraph CFM estimator test builds a decoder-focused flow double. After
+    #6274, ``BatchedToken2Wav.__init__`` accesses ``flow.encoder``. A stub
+    encoder with a plain ``forward_chunk`` is enough; init must not call it.
+    """
+
+    class _Encoder(nn.Module):
+        def forward_chunk(self, xs, last_chunk=False, cnn_cache=None, att_cache=None):
+            raise AssertionError("init must not run the encoder")
+
+    class _Flow(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.encoder = _Encoder()
+            self.decoder = SimpleNamespace(estimator=nn.Module())
+
+    class _Token2Wav:
+        def __init__(self):
+            self.flow = _Flow()
+            self.hift = nn.Identity()
+            self.float16 = False
+            self.n_timesteps = 2
+            self.mel_cache_len = 1
+            self.source_cache_len = 2
+            self.speech_window = torch.ones(4)
+
+    adapter = BatchedToken2Wav(_Token2Wav())
+    assert isinstance(adapter.flow.encoder, _Encoder)
+
+
+def test_undecorate_dynamo_restores_eager_forward_chunk():
+    class _Encoder(nn.Module):
+        def forward_chunk(self, xs):
+            return xs + 1
+
+    encoder = _Encoder()
+    original = _Encoder.forward_chunk
+
+    def compiled_wrapper(*args, **kwargs):
+        raise AssertionError("compiled wrapper must not run")
+
+    compiled_wrapper._torchdynamo_orig_callable = original
+    encoder.forward_chunk = compiled_wrapper
+
+    _undecorate_dynamo(encoder, "forward_chunk")
+    out = encoder.forward_chunk(torch.tensor([1]))
+    assert int(out.item()) == 2
 
 
 def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
